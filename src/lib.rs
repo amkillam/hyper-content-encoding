@@ -8,13 +8,10 @@ use http::{
     header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE},
     HeaderValue, Request, Response,
 };
-use http_body_util::{BodyExt, Full};
-use hyper::{
-    body::{Body, Incoming},
-    service::Service,
-};
+use http_body_util::{combinators::BoxBody, BodyExt, Full};
+use hyper::{body::Incoming, service::Service};
+use std::io::prelude::*;
 use std::{fmt::Debug, future::Future, pin::Pin};
-use std::{io::prelude::*, str::FromStr};
 
 type Result<T> = std::result::Result<T, ResponseToStringError>;
 
@@ -22,6 +19,8 @@ type Result<T> = std::result::Result<T, ResponseToStringError>;
 pub struct ResponseToStringError {
     inner: String,
 }
+
+impl std::error::Error for ResponseToStringError {}
 
 impl ResponseToStringError {
     pub fn new(inner: String) -> Self {
@@ -157,15 +156,29 @@ impl Encoding {
         }
     }
 }
+/// Creates a boxed body from a Byte like type
+pub fn full<T: Into<Bytes>>(chunk: T) -> BoxBody<Bytes, hyper::Error> {
+    Full::new(chunk.into())
+        .map_err(|never| match never {})
+        .boxed()
+}
 
 /// Compresses a response with the desired compression algorithm
 /// Currently, only gzip and deflate are supported
 /// This method will modify the Content-Encoding and Content-Length headers
-pub async fn encode_response(
-    res: &mut Response<dyn BodyExt>,
-    content_encoding: Encoding,
-) -> Result<()> {
-    let body: &[u8] = res.body().collect();
+pub async fn encode_response(res: Res, content_encoding: Encoding) -> Result<Res> {
+    let headers = res.headers().clone();
+    let status = res.status();
+
+    let res = res.map(|b| b.boxed());
+
+    let body: Bytes = res
+        .into_body()
+        .collect()
+        .await
+        .map_err(convert_err)?
+        .to_bytes();
+    let body: &[u8] = &body;
 
     let mut ret_vec: Vec<u8> = Vec::new();
     match content_encoding {
@@ -179,28 +192,31 @@ pub async fn encode_response(
     }?;
 
     let body: Bytes = ret_vec.into();
+    let body_len = body.len();
+
+    let mut res = Response::new(full(body));
+    *res.headers_mut() = headers;
+    *res.status_mut() = status;
 
     res.headers_mut()
         .insert(CONTENT_ENCODING, content_encoding.as_header_value());
 
     res.headers_mut().insert(
         CONTENT_LENGTH,
-        body.len()
+        body_len
             .to_string()
             .parse()
             .expect("Unexpected Content-Length"),
     );
 
-    *res.body_mut() = body;
-
-    Ok(())
+    Ok(res)
 }
 
 /// A hyper service that compresses the responses
 #[derive(Debug, Clone)]
 pub struct Compressor<S> {
     inner: S,
-    encoding: Encoding,
+    // encoding: Encoding,
 }
 
 impl<S> Compressor<S> {
@@ -208,39 +224,44 @@ impl<S> Compressor<S> {
     pub fn new(inner: S) -> Self {
         Compressor {
             inner,
-            encoding: Encoding::Gzip,
+            // encoding: Encoding::Gzip,
         }
     }
 
-    pub fn with_encoding(&mut self, encoding: Encoding) -> &mut Self {
-        self.encoding = encoding;
-        self
-    }
+    // pub fn with_encoding(&mut self, encoding: Encoding) -> &mut Self {
+    //     self.encoding = encoding;
+    //     self
+    // }
 }
 
 type Req = Request<Incoming>;
+type Res = Response<BoxBody<Bytes, hyper::Error>>;
 
 impl<S> Service<Req> for Compressor<S>
 where
-    S: Service<Req, Response = Response<Full<Bytes>>>,
-    S::Future: 'static,
-    S::Error: 'static,
+    S: Service<Req, Response = Res>,
+    S::Future: 'static + Send,
+    S::Error: 'static + Send,
+    S::Error: Debug,
     S::Response: 'static,
 {
-    type Response = S::Response;
-    type Error = S::Error;
-    type Future = Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>>>>;
+    // type Response = S::Response;
+    // type Error = S::Error;
+    // type Future = S::Future;
+    type Response = Res;
+    type Error = Box<ResponseToStringError>;
+    type Future =
+        Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
+    //type Future = Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>>>>;
 
     fn call(&self, req: Req) -> Self::Future {
         let fut = self.inner.call(req);
+        let encoding = Encoding::Gzip; // self.encoding.clone();
 
         let f = async move {
             match fut.await {
-                Ok(response) => {
-                    encode_response(&mut response, self.encoding)?;
-                    Ok(response)
-                }
-                Err(e) => Err(e),
+                Ok(response) => encode_response(response, encoding).await.map_err(Box::new),
+                Err(e) => Err(Box::new(convert_err(e))),
             }
         };
 
