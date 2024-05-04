@@ -1,3 +1,11 @@
+//! Utility for handling Content-Encoding with [`hyper`](https://docs.rs/hyper)
+//!
+//! This crate currently only supports `gzip`, `deflate` and `identity`
+
+// TODO:
+// List of encodings:
+// https://www.iana.org/assignments/http-parameters/http-parameters.xml#http-parameters-1
+
 use bytes::Bytes;
 use core::fmt;
 use flate2::{
@@ -5,42 +13,43 @@ use flate2::{
     Compression,
 };
 use http::{
-    header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE},
+    header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE},
     HeaderValue, Request, Response,
 };
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::{body::Incoming, service::Service};
-use std::io::prelude::*;
 use std::{fmt::Debug, future::Future, pin::Pin};
+use std::{io::prelude::*, str::FromStr};
 
-type Result<T> = std::result::Result<T, ResponseToStringError>;
+type Result<T> = std::result::Result<T, HyperContentEncodingError>;
 
+/// The error used in hyper-content-encoding
 #[derive(Debug, Clone)]
-pub struct ResponseToStringError {
+pub struct HyperContentEncodingError {
     inner: String,
 }
 
-impl std::error::Error for ResponseToStringError {}
+impl std::error::Error for HyperContentEncodingError {}
 
-impl ResponseToStringError {
+impl HyperContentEncodingError {
     pub fn new(inner: String) -> Self {
-        ResponseToStringError { inner }
+        HyperContentEncodingError { inner }
     }
 }
 
-impl From<String> for ResponseToStringError {
+impl From<String> for HyperContentEncodingError {
     fn from(value: String) -> Self {
-        ResponseToStringError::new(value)
+        HyperContentEncodingError::new(value)
     }
 }
 
-impl fmt::Display for ResponseToStringError {
+impl fmt::Display for HyperContentEncodingError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}", self.inner)
     }
 }
 
-fn convert_err<E>(e: E) -> ResponseToStringError
+fn convert_err<E>(e: E) -> HyperContentEncodingError
 where
     E: Debug,
 {
@@ -96,10 +105,10 @@ where
 /// The response *must* contain a `Content-Type` with the word `text`
 ///
 /// Currently the only handled `Content-Encodings` that are supported are
-/// - identity
-/// - x-gzip
-/// - gzip
-/// - deflate
+/// - `identity`
+/// - `x-gzip`
+/// - `gzip`
+/// - `deflate`
 pub async fn response_to_string(res: Response<Incoming>) -> Result<String> {
     if let Some(content_type) = res.headers().get(CONTENT_TYPE) {
         if content_type.to_str().map_err(convert_err)?.contains("text") {
@@ -138,21 +147,27 @@ pub async fn response_to_string(res: Response<Incoming>) -> Result<String> {
     }
 }
 
-/// An enum describing the different available encoding types
-#[derive(Debug, Clone)]
+/// The different supported encoding types
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Encoding {
     /// gzip
     Gzip,
 
     /// deflate
     Deflate,
+
+    /// Identity
+    Identity,
 }
 
 impl Encoding {
     fn as_header_value(&self) -> HeaderValue {
         match &self {
             Encoding::Gzip => HeaderValue::from_static("gzip"),
+
             Encoding::Deflate => HeaderValue::from_static("deflate"),
+
+            Encoding::Identity => HeaderValue::from_static("identity"),
         }
     }
 }
@@ -163,9 +178,25 @@ pub fn full<T: Into<Bytes>>(chunk: T) -> BoxBody<Bytes, hyper::Error> {
         .boxed()
 }
 
-/// Compresses a response with the desired compression algorithm
-/// Currently, only gzip and deflate are supported
-/// This method will modify the Content-Encoding and Content-Length headers
+impl FromStr for Encoding {
+    type Err = HyperContentEncodingError;
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "x-gzip" | "gzip" => Ok(Encoding::Gzip),
+            "deflate" => Ok(Encoding::Deflate),
+            "identity" => Ok(Encoding::Identity),
+            _ => Err(format!("Unrecognized encoding {}", value).into()),
+        }
+    }
+}
+
+/// Compresses a response with the desired compression algorithm.
+///
+/// Currently, only `gzip` and `deflate` are supported
+///
+/// This method will modify the `Content-Encoding` and `Content-Length` headers
+///
+/// TODO: encode the stream
 pub async fn encode_response(res: Res, content_encoding: Encoding) -> Result<Res> {
     let headers = res.headers().clone();
     let status = res.status();
@@ -178,17 +209,27 @@ pub async fn encode_response(res: Res, content_encoding: Encoding) -> Result<Res
         .await
         .map_err(convert_err)?
         .to_bytes();
-    let body: &[u8] = &body;
 
     let mut ret_vec: Vec<u8> = Vec::new();
     match content_encoding {
-        Encoding::Gzip => GzEncoder::new(body, Compression::fast())
-            .read_to_end(&mut ret_vec)
-            .map_err(convert_err),
+        Encoding::Gzip => {
+            let body: &[u8] = &body;
+            GzEncoder::new(body, Compression::fast())
+                .read_to_end(&mut ret_vec)
+                .map_err(convert_err)
+        }
 
-        Encoding::Deflate => DeflateEncoder::new(body, Compression::fast())
-            .read_to_end(&mut ret_vec)
-            .map_err(convert_err),
+        Encoding::Deflate => {
+            let body: &[u8] = &body;
+            DeflateEncoder::new(body, Compression::fast())
+                .read_to_end(&mut ret_vec)
+                .map_err(convert_err)
+        }
+
+        Encoding::Identity => {
+            ret_vec = body.into();
+            Ok(ret_vec.len())
+        }
     }?;
 
     let body: Bytes = ret_vec.into();
@@ -212,26 +253,136 @@ pub async fn encode_response(res: Res, content_encoding: Encoding) -> Result<Res
     Ok(res)
 }
 
-/// A hyper service that compresses the responses
+/// A hyper service that compresses responses
 #[derive(Debug, Clone)]
 pub struct Compressor<S> {
     inner: S,
-    // encoding: Encoding,
 }
 
 impl<S> Compressor<S> {
-    /// Creates a new Compression middleware that uses Gzip
+    /// Creates a new Compression middleware that uses `gzip`
     pub fn new(inner: S) -> Self {
-        Compressor {
-            inner,
-            // encoding: Encoding::Gzip,
+        Compressor { inner }
+    }
+}
+
+/// Pareses a Quality Values
+/// https://datatracker.ietf.org/doc/html/rfc9110#quality.values
+///
+///  weight = OWS ";" OWS "q=" qvalue
+///  qvalue = ( "0" [ "." 0*3DIGIT ] )
+///         / ( "1" [ "." 0*3("0") ] )
+fn parse_weight(input: &str) -> Option<f32> {
+    let mut chars = input.chars().peekable();
+
+    // Parse leading optional white space
+    while let Some(ch) = chars.peek() {
+        if !ch.is_whitespace() {
+            break;
+        }
+
+        chars.next();
+    }
+
+    // Parse ";"
+    if chars.next() != Some(';') {
+        eprintln!("psyche");
+        return None;
+    }
+
+    // Parse optional white space after ";"
+    while let Some(ch) = chars.peek() {
+        if !ch.is_whitespace() {
+            break;
+        }
+
+        chars.next();
+    }
+
+    // Parse "q="
+    if chars.next() != Some('q') || chars.next() != Some('=') {
+        eprintln!("Butt");
+        return None;
+    }
+
+    // Parse qvalue
+    let mut qvalue_str = String::new();
+    for ch in &mut chars {
+        if !ch.is_ascii_digit() && ch != '.' {
+            break;
+        }
+        qvalue_str.push(ch);
+    }
+
+    // Parse qvalue into a float
+    let qvalue: f32 = qvalue_str.parse().ok()?;
+
+    if (0.0..1.0).contains(&qvalue) {
+        Some(qvalue)
+    } else {
+        eprintln!("Q={}", qvalue);
+        None
+    }
+}
+
+// Parses the prefered_encoding (only keeping the currently supported encodings)
+fn parse_encoding(accepted_encodings: &str) -> Vec<(Encoding, f32)> {
+    let mut accepted_encodings = accepted_encodings.trim();
+
+    let mut res = Vec::new();
+
+    let mut default_weight: Option<f32> = None;
+
+    loop {
+        for token in ["gzip", "deflate", "identity", "*"] {
+            if accepted_encodings.starts_with(token) {
+                (_, accepted_encodings) = accepted_encodings.split_at(token.len());
+
+                let mut weight: f32 = 1.0;
+                if let Some(res) = parse_weight(accepted_encodings) {
+                    weight = res;
+                }
+
+                if token == "*" {
+                    default_weight = Some(weight);
+                } else {
+                    res.push((Encoding::from_str(token).unwrap(), weight));
+                }
+
+                break;
+            }
+        }
+
+        if let Some(index) = accepted_encodings.find(',') {
+            (_, accepted_encodings) = accepted_encodings.split_at(index);
+            let mut chars = accepted_encodings.chars();
+            chars.next();
+            accepted_encodings = chars.as_str().trim();
+        } else {
+            break;
         }
     }
 
-    // pub fn with_encoding(&mut self, encoding: Encoding) -> &mut Self {
-    //     self.encoding = encoding;
-    //     self
-    // }
+    if let Some(weigth) = default_weight {
+        for encoding in [Encoding::Gzip, Encoding::Deflate, Encoding::Identity] {
+            if !res.iter().any(|(x, _)| *x == encoding) {
+                res.push((encoding, weigth));
+            }
+        }
+    } else if !res.iter().any(|(x, _)| *x == Encoding::Identity) {
+        res.push((Encoding::Identity, 1.0));
+    }
+
+    res
+
+    // Else fail with 415
+}
+
+fn prefered_encoding(accepted_encodings: &str) -> Option<Encoding> {
+    let mut encodings = parse_encoding(accepted_encodings);
+    encodings.sort_by_key(|&(_, w)| -(w * 1000.0) as i32);
+
+    encodings.first().map(|(e, _)| e.to_owned())
 }
 
 type Req = Request<Incoming>;
@@ -245,26 +396,96 @@ where
     S::Error: Debug,
     S::Response: 'static,
 {
-    // type Response = S::Response;
-    // type Error = S::Error;
-    // type Future = S::Future;
     type Response = Res;
-    type Error = Box<ResponseToStringError>;
+    type Error = Box<HyperContentEncodingError>;
     type Future =
         Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
-    //type Future = Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>>>>;
 
     fn call(&self, req: Req) -> Self::Future {
+        let headers = req.headers().clone();
+
         let fut = self.inner.call(req);
-        let encoding = Encoding::Gzip; // self.encoding.clone();
+        let encoding = Encoding::Gzip;
 
         let f = async move {
             match fut.await {
-                Ok(response) => encode_response(response, encoding).await.map_err(Box::new),
+                Ok(response) => {
+                    if let Some(accepted_encodings) = headers.get(ACCEPT_ENCODING) {
+                        if let Some(encoding) = accepted_encodings
+                            .to_str()
+                            .ok()
+                            .and_then(|s| prefered_encoding(s))
+                        {}
+                        encode_response(response, encoding).await.map_err(Box::new)
+                    } else {
+                        Ok(response)
+                    }
+                }
                 Err(e) => Err(Box::new(convert_err(e))),
             }
         };
 
         Box::pin(f)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_weight() {
+        let result = parse_encoding("compress, gzip");
+        assert_eq!(
+            vec![(Encoding::Gzip, 1.0), (Encoding::Identity, 1.0)],
+            result
+        );
+    }
+
+    #[test]
+    fn empty() {
+        let result = parse_encoding("");
+        assert_eq!(vec![(Encoding::Identity, 1.0)], result);
+    }
+
+    #[test]
+    fn star() {
+        let result = parse_encoding("*");
+        assert_eq!(
+            vec![
+                (Encoding::Gzip, 1.0),
+                (Encoding::Deflate, 1.0),
+                (Encoding::Identity, 1.0)
+            ],
+            result
+        );
+    }
+
+    #[test]
+    fn weigth() {
+        let result = parse_encoding("deflate;q=0.5, gzip;q=1.0");
+        eprintln!("{:?}", result);
+        assert_eq!(
+            vec![
+                (Encoding::Deflate, 0.5),
+                (Encoding::Gzip, 1.0),
+                (Encoding::Identity, 1.0)
+            ],
+            result
+        );
+    }
+
+    #[test]
+    fn no_identity() {
+        let result = parse_encoding("gzip;q=1.0, deflate; q=0.5, *;q=0");
+        eprintln!("{:?}", result);
+        assert_eq!(
+            vec![
+                (Encoding::Gzip, 1.0),
+                (Encoding::Deflate, 0.5),
+                (Encoding::Identity, 0.0)
+            ],
+            result
+        );
     }
 }

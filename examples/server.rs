@@ -12,7 +12,7 @@ use tokio::net::TcpListener;
 use tower::ServiceBuilder;
 
 async fn hello(_: Request<Incoming>) -> Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
-    Ok(Response::new(full(Bytes::from("Hello, World!\n"))))
+    Ok(Response::new(full(Bytes::from("<p>Lorem ipsum dolor sit amet, consectetur adipiscing elit. Praesent id nulla augue. Integer viverra risus ut dolor tempor, a porttitor mauris placerat. Aliquam sollicitudin ullamcorper leo. Praesent interdum interdum odio, sed vehicula lacus accumsan ut. Duis dignissim, libero eu interdum porta, risus leo rutrum risus, nec tincidunt augue ex vitae neque. Aenean in massa pharetra, faucibus enim quis, elementum velit. Donec tortor urna, consectetur fermentum magna at, tempus vulputate lacus. Nam tincidunt mi felis, sit amet pulvinar tortor laoreet eu. Phasellus pellentesque sapien tincidunt diam auctor volutpat.</p>"))))
 }
 
 #[tokio::main]
