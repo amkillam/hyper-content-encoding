@@ -14,7 +14,7 @@ use flate2::{
 };
 use http::{
     header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE},
-    HeaderValue, Request, Response,
+    HeaderValue, Request, Response, StatusCode,
 };
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::{body::Incoming, service::Service};
@@ -382,7 +382,10 @@ fn prefered_encoding(accepted_encodings: &str) -> Option<Encoding> {
     let mut encodings = parse_encoding(accepted_encodings);
     encodings.sort_by_key(|&(_, w)| -(w * 1000.0) as i32);
 
-    encodings.first().map(|(e, _)| e.to_owned())
+    encodings
+        .iter()
+        .find(|(_, w)| *w > 0.0)
+        .map(|(e, _)| e.to_owned())
 }
 
 type Req = Request<Incoming>;
@@ -404,23 +407,28 @@ where
     fn call(&self, req: Req) -> Self::Future {
         let headers = req.headers().clone();
 
+        // Gets the desired encoding
+        let encoding = if let Some(accepted_encodings) = headers.get(ACCEPT_ENCODING) {
+            if let Some(desired_encoding) =
+                accepted_encodings.to_str().ok().and_then(prefered_encoding)
+            {
+                desired_encoding
+            } else {
+                return Box::pin(async move {
+                    let mut res = Response::new(full("Unsuported requestedd encoding"));
+                    *res.status_mut() = StatusCode::NOT_ACCEPTABLE;
+                    Ok(res)
+                });
+            }
+        } else {
+            Encoding::Gzip
+        };
+
         let fut = self.inner.call(req);
-        let encoding = Encoding::Gzip;
 
         let f = async move {
             match fut.await {
-                Ok(response) => {
-                    if let Some(accepted_encodings) = headers.get(ACCEPT_ENCODING) {
-                        if let Some(encoding) = accepted_encodings
-                            .to_str()
-                            .ok()
-                            .and_then(|s| prefered_encoding(s))
-                        {}
-                        encode_response(response, encoding).await.map_err(Box::new)
-                    } else {
-                        Ok(response)
-                    }
-                }
+                Ok(response) => encode_response(response, encoding).await.map_err(Box::new),
                 Err(e) => Err(Box::new(convert_err(e))),
             }
         };
