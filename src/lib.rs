@@ -286,7 +286,6 @@ fn parse_weight(input: &str) -> Option<f32> {
 
     // Parse ";"
     if chars.next() != Some(';') {
-        eprintln!("psyche");
         return None;
     }
 
@@ -301,7 +300,6 @@ fn parse_weight(input: &str) -> Option<f32> {
 
     // Parse "q="
     if chars.next() != Some('q') || chars.next() != Some('=') {
-        eprintln!("Butt");
         return None;
     }
 
@@ -415,7 +413,7 @@ where
                 desired_encoding
             } else {
                 return Box::pin(async move {
-                    let mut res = Response::new(full("Unsuported requestedd encoding"));
+                    let mut res = Response::new(full("Unsuported requestedd encoding\n"));
                     *res.status_mut() = StatusCode::NOT_ACCEPTABLE;
                     Ok(res)
                 });
