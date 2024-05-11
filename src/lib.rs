@@ -109,35 +109,24 @@ where
 /// - `x-gzip`
 /// - `gzip`
 /// - `deflate`
+/// TODO: stream
 pub async fn response_to_string(res: Response<Incoming>) -> Result<String> {
     if let Some(content_type) = res.headers().get(CONTENT_TYPE) {
         if content_type.to_str().map_err(convert_err)?.contains("text") {
-            let content_encoding = match res.headers().get(CONTENT_ENCODING) {
-                Some(content_encoding) => {
-                    content_encoding.to_str().map_err(convert_err)?.to_owned()
+            if let Some(encoding) = Encoding::get_response_encoding(&res) {
+                let res = res.map(|b| b.boxed());
+                let body: Bytes = res.collect().await.map_err(convert_err)?.to_bytes();
+
+                match encoding {
+                    Encoding::Gzip => decompress::<GzDecoder<_>>(&body),
+                    Encoding::Deflate => decompress::<DeflateDecoder<_>>(&body),
+                    Encoding::Identity => {
+                        let body = String::from_utf8_lossy(&body).to_string();
+                        Ok(body)
+                    }
                 }
-                None => "identity".to_owned(),
-            };
-
-            let res = res.map(|b| b.boxed());
-            let body: Bytes = res.collect().await.map_err(convert_err)?.to_bytes();
-
-            match content_encoding.as_str() {
-                "identity" => {
-                    let body = String::from_utf8_lossy(&body).to_string();
-                    Ok(body)
-                }
-
-                "x-gzip" => decompress::<GzDecoder<_>>(&body),
-                "gzip" => decompress::<GzDecoder<_>>(&body),
-
-                "compress" => {
-                    todo!()
-                }
-
-                "deflate" => decompress::<DeflateDecoder<_>>(&body),
-
-                _ => Err(format!("Unknown Content-Type {content_encoding}").into()),
+            } else {
+                Err(format!("Unknown Content-Type").into())
             }
         } else {
             Err("Content-Type does not specify text".to_string().into())
@@ -170,7 +159,27 @@ impl Encoding {
             Encoding::Identity => HeaderValue::from_static("identity"),
         }
     }
+
+    /// Retrieves the content encoding of a response.
+    /// If the encoding is not supported returns None
+    pub fn get_response_encoding(res: &Response<Incoming>) -> Option<Self> {
+        if let Some(content_encoding) = res
+            .headers()
+            .get(CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok())
+        {
+            match content_encoding {
+                "gzip" | "x-gzip" => Some(Encoding::Gzip),
+                "deflate" => Some(Encoding::Gzip),
+                "identitiy" => Some(Encoding::Identity),
+                _ => None,
+            }
+        } else {
+            Some(Encoding::Identity)
+        }
+    }
 }
+
 /// Creates a boxed body from a Byte like type
 pub fn full<T: Into<Bytes>>(chunk: T) -> BoxBody<Bytes, hyper::Error> {
     Full::new(chunk.into())
