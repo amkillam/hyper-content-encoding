@@ -442,7 +442,7 @@ fn parse_encoding(accepted_encodings: &str) -> Vec<(Encoding, f32)> {
     // Else fail with 415
 }
 
-fn prefered_encoding(accepted_encodings: &str) -> Option<Encoding> {
+pub fn preferred_encoding(accepted_encodings: &str) -> Option<Encoding> {
     let mut encodings = parse_encoding(accepted_encodings);
     encodings.sort_by_key(|&(_, w)| -(w * 1000.0) as i32);
 
@@ -474,7 +474,7 @@ where
         // Gets the desired encoding
         let encoding = if let Some(accepted_encodings) = headers.get(ACCEPT_ENCODING) {
             if let Some(desired_encoding) =
-                accepted_encodings.to_str().ok().and_then(prefered_encoding)
+                accepted_encodings.to_str().ok().and_then(preferred_encoding)
             {
                 desired_encoding
             } else {
