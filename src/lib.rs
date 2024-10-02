@@ -12,6 +12,8 @@ use flate2::{
     read::{DeflateDecoder, DeflateEncoder, GzDecoder, GzEncoder, ZlibDecoder},
     Compression,
 };
+use brotli::{Decompressor as BrotliDecoder, CompressorReader as BrotliEncoder};
+use zstd::{Decoder as ZstdDecoder, Encoder as ZstdEncoder};
 use http::{
     header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE},
     HeaderMap, HeaderValue, Request, Response, StatusCode,
@@ -59,16 +61,17 @@ where
 trait Decoder<T>: Read
 where
     T: Read,
+    Self: Sized,
 {
-    fn new(_: T) -> Self;
+    fn new(_: T) -> std::io::Result<Self>;
 }
 
 impl<R> Decoder<R> for GzDecoder<R>
 where
     R: Read,
 {
-    fn new(reader: R) -> Self {
-        GzDecoder::new(reader)
+    fn new(reader: R) -> std::io::Result<Self> {
+        Ok(GzDecoder::new(reader))
     }
 }
 
@@ -76,8 +79,8 @@ impl<R> Decoder<R> for DeflateDecoder<R>
 where
     R: Read,
 {
-    fn new(reader: R) -> Self {
-        DeflateDecoder::new(reader)
+    fn new(reader: R) -> std::io::Result<Self> {
+        Ok(DeflateDecoder::new(reader))
     }
 }
 
@@ -85,8 +88,27 @@ impl<R> Decoder<R> for ZlibDecoder<R>
 where
     R: Read,
 {
-    fn new(reader: R) -> Self {
-        ZlibDecoder::new(reader)
+    fn new(reader: R) -> std::io::Result<Self> {
+        Ok(ZlibDecoder::new(reader))
+    }
+}
+
+impl<R> Decoder<R> for BrotliDecoder<R>
+where
+    R: Read + AsRef<[u8]>,
+{
+    fn new(reader: R) -> std::io::Result<Self> {
+        let reader_len = reader.as_ref().len();
+        Ok(BrotliDecoder::new(reader, reader_len) )
+    }
+}
+
+impl<'a, R> Decoder<R> for ZstdDecoder<'a, std::io::BufReader<R>>
+where
+    R: Read,
+{
+    fn new(reader: R) -> std::io::Result<Self> {
+        ZstdDecoder::new(reader)
     }
 }
 
@@ -95,7 +117,7 @@ where
     T: Decoder<&'a [u8]>,
 {
     let reader: &[u8] = body;
-    let mut decoder = T::new(reader);
+    let mut decoder = T::new(reader).map_err(convert_err)?;
     let mut s = String::new();
     decoder.read_to_string(&mut s).map_err(convert_err)?;
     Ok(s)
@@ -109,6 +131,8 @@ where
 /// - `x-gzip`
 /// - `gzip`
 /// - `deflate`
+/// - `br`
+/// - `zstd`
 /// TODO: stream
 pub async fn response_to_string(res: Response<Incoming>) -> Result<String> {
     if let Some(content_type) = res.headers().get(CONTENT_TYPE) {
@@ -120,6 +144,8 @@ pub async fn response_to_string(res: Response<Incoming>) -> Result<String> {
             match encoding {
                 Encoding::Gzip => decompress::<GzDecoder<_>>(&body),
                 Encoding::Deflate => decompress::<DeflateDecoder<_>>(&body),
+                Encoding::Brotli => decompress::<BrotliDecoder<_>>(&body),
+                Encoding::Zstd => decompress::<ZstdDecoder<_>>(&body),
                 Encoding::Identity => {
                     let body = String::from_utf8_lossy(&body).to_string();
                     Ok(body)
@@ -144,6 +170,12 @@ pub enum Encoding {
 
     /// Identity
     Identity,
+
+    /// Brotli
+    Brotli,
+
+    /// Zstd
+    Zstd,
 }
 
 impl Encoding {
@@ -154,6 +186,10 @@ impl Encoding {
             Encoding::Deflate => HeaderValue::from_static("deflate"),
 
             Encoding::Identity => HeaderValue::from_static("identity"),
+
+            Encoding::Brotli => HeaderValue::from_static("br"),
+
+            Encoding::Zstd => HeaderValue::from_static("zstd"),
         }
     }
 
@@ -164,8 +200,10 @@ impl Encoding {
         {
             match content_encoding {
                 "gzip" | "x-gzip" => Ok(Encoding::Gzip),
-                "deflate" => Ok(Encoding::Gzip),
-                "identitiy" => Ok(Encoding::Identity),
+                "deflate" => Ok(Encoding::Deflate),
+                "identity" => Ok(Encoding::Identity),
+                "br" => Ok(Encoding::Brotli),
+                "zstd" => Ok(Encoding::Zstd),
                 _ => Err(format!("Unknown Content-Encoding {content_encoding}").into()),
             }
         } else {
@@ -188,6 +226,8 @@ impl FromStr for Encoding {
             "x-gzip" | "gzip" => Ok(Encoding::Gzip),
             "deflate" => Ok(Encoding::Deflate),
             "identity" => Ok(Encoding::Identity),
+            "br" => Ok(Encoding::Brotli),
+            "zstd" => Ok(Encoding::Zstd),
             _ => Err(format!("Unrecognized encoding {}", value).into()),
         }
     }
@@ -233,6 +273,23 @@ pub async fn encode_response(res: Res, content_encoding: Encoding) -> Result<Res
             ret_vec = body.into();
             Ok(ret_vec.len())
         }
+
+        Encoding::Brotli => {
+            let body: &[u8] = &body;
+            let brotli_level = brotli::enc::BrotliEncoderParams::default();
+            BrotliEncoder::new(body, body.len(), brotli_level.quality as u32, brotli_level.lgwin as u32)
+                .read_to_end(&mut ret_vec)
+                .map_err(convert_err)
+        }
+
+        Encoding::Zstd => {
+            let body: &[u8] = &body;
+            ZstdEncoder::new(&mut ret_vec, zstd::DEFAULT_COMPRESSION_LEVEL)
+                .map_err(convert_err  )?
+                .write_all(body)
+                .map_err(convert_err)?;
+            Ok(body.len())
+        }
     }?;
 
     let body: Bytes = ret_vec.into();
@@ -269,7 +326,7 @@ impl<S> Compressor<S> {
     }
 }
 
-/// Pareses a Quality Values
+/// Parses a Quality Values
 /// https://datatracker.ietf.org/doc/html/rfc9110#quality.values
 ///
 ///  weight = OWS ";" OWS "q=" qvalue
@@ -326,7 +383,7 @@ fn parse_weight(input: &str) -> Option<f32> {
     }
 }
 
-// Parses the prefered_encoding (only keeping the currently supported encodings)
+// Parses the preferred_encoding (only keeping the currently supported encodings)
 fn parse_encoding(accepted_encodings: &str) -> Vec<(Encoding, f32)> {
     let mut accepted_encodings = accepted_encodings.trim();
 
@@ -335,7 +392,7 @@ fn parse_encoding(accepted_encodings: &str) -> Vec<(Encoding, f32)> {
     let mut default_weight: Option<f32> = None;
 
     loop {
-        for token in ["gzip", "deflate", "identity", "*"] {
+        for token in ["gzip", "deflate", "identity", "br", "zstd", "*"] {
             if accepted_encodings.starts_with(token) {
                 (_, accepted_encodings) = accepted_encodings.split_at(token.len());
 
@@ -364,10 +421,16 @@ fn parse_encoding(accepted_encodings: &str) -> Vec<(Encoding, f32)> {
         }
     }
 
-    if let Some(weigth) = default_weight {
-        for encoding in [Encoding::Gzip, Encoding::Deflate, Encoding::Identity] {
+    if let Some(weight) = default_weight {
+        for encoding in [
+            Encoding::Gzip,
+            Encoding::Deflate,
+            Encoding::Identity,
+            Encoding::Brotli,
+            Encoding::Zstd,
+        ] {
             if !res.iter().any(|(x, _)| *x == encoding) {
-                res.push((encoding, weigth));
+                    res.push((encoding, weight));
             }
         }
     } else if !res.iter().any(|(x, _)| *x == Encoding::Identity) {
@@ -416,7 +479,7 @@ where
                 desired_encoding
             } else {
                 return Box::pin(async move {
-                    let mut res = Response::new(full("Unsuported requestedd encoding\n"));
+                    let mut res = Response::new(full("Unsupported requested encoding\n"));
                     *res.status_mut() = StatusCode::NOT_ACCEPTABLE;
                     Ok(res)
                 });
