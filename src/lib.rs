@@ -160,6 +160,7 @@ pub async fn response_to_string(res: Response<Incoming>) -> Result<String> {
 }
 
 /// The different supported encoding types
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Encoding {
     /// gzip
