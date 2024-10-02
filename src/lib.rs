@@ -6,14 +6,13 @@
 // List of encodings:
 // https://www.iana.org/assignments/http-parameters/http-parameters.xml#http-parameters-1
 
+use brotli::{CompressorReader as BrotliEncoder, Decompressor as BrotliDecoder};
 use bytes::Bytes;
 use core::fmt;
 use flate2::{
     read::{DeflateDecoder, DeflateEncoder, GzDecoder, GzEncoder, ZlibDecoder},
     Compression,
 };
-use brotli::{Decompressor as BrotliDecoder, CompressorReader as BrotliEncoder};
-use zstd::{Decoder as ZstdDecoder, Encoder as ZstdEncoder};
 use http::{
     header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE},
     HeaderMap, HeaderValue, Request, Response, StatusCode,
@@ -22,6 +21,7 @@ use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::{body::Incoming, service::Service};
 use std::{fmt::Debug, future::Future, pin::Pin};
 use std::{io::prelude::*, str::FromStr};
+use zstd::{Decoder as ZstdDecoder, Encoder as ZstdEncoder};
 
 type Result<T> = std::result::Result<T, HyperContentEncodingError>;
 
@@ -99,7 +99,7 @@ where
 {
     fn new(reader: R) -> std::io::Result<Self> {
         let reader_len = reader.as_ref().len();
-        Ok(BrotliDecoder::new(reader, reader_len) )
+        Ok(BrotliDecoder::new(reader, reader_len))
     }
 }
 
@@ -160,7 +160,7 @@ pub async fn response_to_string(res: Response<Incoming>) -> Result<String> {
 }
 
 /// The different supported encoding types
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Encoding {
     /// gzip
     Gzip,
@@ -277,15 +277,20 @@ pub async fn encode_response(res: Res, content_encoding: Encoding) -> Result<Res
         Encoding::Brotli => {
             let body: &[u8] = &body;
             let brotli_level = brotli::enc::BrotliEncoderParams::default();
-            BrotliEncoder::new(body, body.len(), brotli_level.quality as u32, brotli_level.lgwin as u32)
-                .read_to_end(&mut ret_vec)
-                .map_err(convert_err)
+            BrotliEncoder::new(
+                body,
+                body.len(),
+                brotli_level.quality as u32,
+                brotli_level.lgwin as u32,
+            )
+            .read_to_end(&mut ret_vec)
+            .map_err(convert_err)
         }
 
         Encoding::Zstd => {
             let body: &[u8] = &body;
             ZstdEncoder::new(&mut ret_vec, zstd::DEFAULT_COMPRESSION_LEVEL)
-                .map_err(convert_err  )?
+                .map_err(convert_err)?
                 .write_all(body)
                 .map_err(convert_err)?;
             Ok(body.len())
@@ -430,7 +435,7 @@ fn parse_encoding(accepted_encodings: &str) -> Vec<(Encoding, f32)> {
             Encoding::Zstd,
         ] {
             if !res.iter().any(|(x, _)| *x == encoding) {
-                    res.push((encoding, weight));
+                res.push((encoding, weight));
             }
         }
     } else if !res.iter().any(|(x, _)| *x == Encoding::Identity) {
@@ -473,8 +478,10 @@ where
 
         // Gets the desired encoding
         let encoding = if let Some(accepted_encodings) = headers.get(ACCEPT_ENCODING) {
-            if let Some(desired_encoding) =
-                accepted_encodings.to_str().ok().and_then(preferred_encoding)
+            if let Some(desired_encoding) = accepted_encodings
+                .to_str()
+                .ok()
+                .and_then(preferred_encoding)
             {
                 desired_encoding
             } else {
