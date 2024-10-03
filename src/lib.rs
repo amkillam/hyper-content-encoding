@@ -236,7 +236,7 @@ impl FromStr for Encoding {
 
 /// Compresses a response with the desired compression algorithm.
 ///
-/// Currently, only `gzip` and `deflate` are supported
+/// Currently, only `gzip`, `deflate`, brotli, and zstd are supported
 ///
 /// This method will modify the `Content-Encoding` and `Content-Length` headers
 ///
@@ -244,8 +244,6 @@ impl FromStr for Encoding {
 pub async fn encode_response(res: Res, content_encoding: Encoding) -> Result<Res> {
     let headers = res.headers().clone();
     let status = res.status();
-
-    let res = res.map(|b| b.boxed());
 
     let body: Bytes = res
         .into_body()
